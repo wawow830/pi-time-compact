@@ -5,83 +5,47 @@
  * next prompt after a break starts from a summary instead of resending a long
  * transcript whose prompt cache has most likely expired.
  *
- * Configure in ~/.pi/agent/settings.json or <project>/.pi/settings.json:
+ * Configure with /idle-compact, or in ~/.pi/agent/settings.json or <project>/.pi/settings.json:
  *
  * ```json
  * { "idleCompaction": { "enabled": true, "timeoutMs": 1800000, "minTokens": 0 } }
  * ```
  */
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { IdleCompactionSettingsPanel } from "./src/settings-panel.ts";
 import {
-	DEFAULT_COMPACTION_SETTINGS,
-	type ExtensionAPI,
-	type ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+	formatDuration,
+	formatTokens,
+	type IdleCompactionSettings,
+	resolveIdleCompactionSettings,
+	resolveKeepRecentTokens,
+	saveGlobalIdleCompactionSettings,
+} from "./src/settings.ts";
 
-export const SETTINGS_KEY = "idleCompaction";
-
-export interface IdleCompactionSettings {
-	/** Compact idle sessions. Default `true`. */
-	enabled: boolean;
-	/** Idle time before compacting, in milliseconds. Default 30 minutes. */
-	timeoutMs: number;
-	/** Skip sessions whose context is smaller than this many tokens. Default `0`. */
-	minTokens: number;
-	/** Optional focus instructions for the summary, as with `/compact [instructions]`. */
-	customInstructions?: string;
-}
-
-export const DEFAULT_IDLE_COMPACTION_SETTINGS: IdleCompactionSettings = {
-	enabled: true,
-	timeoutMs: 30 * 60 * 1000,
-	minTokens: 0,
-};
-
-const isNonNegativeInteger = (value: unknown): value is number =>
-	typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-
-/** Resolve extension settings from pi's merged settings, falling back per field like pi does. */
-export function resolveIdleCompactionSettings(settings: Record<string, unknown>): IdleCompactionSettings {
-	const raw = settings[SETTINGS_KEY];
-	const value = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-	const defaults = DEFAULT_IDLE_COMPACTION_SETTINGS;
-	return {
-		enabled: typeof value.enabled === "boolean" ? value.enabled : defaults.enabled,
-		timeoutMs: isNonNegativeInteger(value.timeoutMs) && value.timeoutMs > 0 ? value.timeoutMs : defaults.timeoutMs,
-		minTokens: isNonNegativeInteger(value.minTokens) ? value.minTokens : defaults.minTokens,
-		customInstructions:
-			typeof value.customInstructions === "string" && value.customInstructions.trim()
-				? value.customInstructions.trim()
-				: undefined,
-	};
-}
-
-/** `compaction.keepRecentTokens`, honoring `compaction.modelOverrides` the same way pi resolves it. */
-export function resolveKeepRecentTokens(
-	settings: Record<string, unknown>,
-	model: { provider: string; id: string } | undefined,
-): number {
-	const compaction = (settings.compaction ?? {}) as {
-		keepRecentTokens?: unknown;
-		modelOverrides?: Record<string, { keepRecentTokens?: unknown } | undefined>;
-	};
-	const override = model ? compaction.modelOverrides?.[`${model.provider}/${model.id}`]?.keepRecentTokens : undefined;
-	if (isNonNegativeInteger(override)) return override;
-	if (isNonNegativeInteger(compaction.keepRecentTokens)) return compaction.keepRecentTokens;
-	return DEFAULT_COMPACTION_SETTINGS.keepRecentTokens;
-}
+export * from "./src/settings.ts";
 
 export default function idleCompaction(pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let openPrompts = 0;
 	/** Set after an idle compaction so pi stops warming the now-stale prompt cache entry. */
 	let stopCacheWarming = false;
+	/**
+	 * Changes saved from /idle-compact. `pi.getSettings()` only rereads settings files on /reload,
+	 * so they are applied on top until then. Kept across session switches within this runtime.
+	 */
+	let changes: Partial<IdleCompactionSettings> = {};
+	let saving = Promise.resolve();
+
+	const readSettings = () => pi.getSettings() as unknown as Record<string, unknown>;
+	const currentSettings = (): IdleCompactionSettings => ({
+		...resolveIdleCompactionSettings(readSettings()),
+		...changes,
+	});
 
 	const disarm = () => {
 		if (timer) clearTimeout(timer);
 		timer = undefined;
 	};
-
-	const readSettings = () => pi.getSettings() as unknown as Record<string, unknown>;
 
 	/** Whether compacting now would actually summarize something worthwhile. */
 	const worthCompacting = (ctx: ExtensionContext, settings: IdleCompactionSettings): boolean => {
@@ -96,7 +60,7 @@ export default function idleCompaction(pi: ExtensionAPI) {
 	const arm = (ctx: ExtensionContext) => {
 		disarm();
 		if (openPrompts > 0) return;
-		const settings = resolveIdleCompactionSettings(readSettings());
+		const settings = currentSettings();
 		if (!settings.enabled) return;
 
 		timer = setTimeout(() => {
@@ -115,6 +79,44 @@ export default function idleCompaction(pi: ExtensionAPI) {
 		// Never keep the process alive just to compact.
 		timer.unref?.();
 	};
+
+	const applyChange = (ctx: ExtensionContext, patch: Partial<IdleCompactionSettings>) => {
+		changes = { ...changes, ...patch };
+		saving = saving
+			.then(() => saveGlobalIdleCompactionSettings(patch))
+			.catch((error: unknown) => {
+				ctx.ui.notify(`Failed to save idle compaction settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+			});
+	};
+
+	pi.registerCommand("idle-compact", {
+		description: "Configure idle compaction",
+		handler: async (_args, ctx) => {
+			const settings = currentSettings();
+			if (ctx.mode !== "tui") {
+				const state = settings.enabled ? `after ${formatDuration(settings.timeoutMs)} idle` : "off";
+				ctx.ui.notify(
+					`Idle compaction: ${state}, minimum context ${formatTokens(settings.minTokens)}. Configure "idleCompaction" in settings.json.`,
+					"info",
+				);
+				return;
+			}
+			// The panel is a UI prompt, so the idle timer pauses while it is open and re-arms with the
+			// new settings when it closes.
+			await ctx.ui.custom<void>(
+				(tui, theme, _keybindings, done) =>
+					new IdleCompactionSettingsPanel({
+						theme,
+						settings,
+						keepRecentTokens: resolveKeepRecentTokens(readSettings(), ctx.model),
+						onChange: (patch) => applyChange(ctx, patch),
+						onClose: () => done(),
+						requestRender: () => tui.requestRender(),
+					}),
+			);
+			await saving;
+		},
+	});
 
 	// Idle starts when a session opens and whenever a run has fully settled.
 	pi.on("session_start", (_event, ctx) => arm(ctx));

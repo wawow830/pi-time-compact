@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, describe, it, mock } from "node:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, beforeEach, describe, it, mock } from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import idleCompaction, {
 	DEFAULT_IDLE_COMPACTION_SETTINGS,
 	resolveIdleCompactionSettings,
@@ -28,6 +32,7 @@ type Handler = (event: unknown, ctx: unknown) => unknown;
 
 function setup(settings: Record<string, unknown>, state: { idle?: boolean; tokens?: number | null; lastType?: string } = {}) {
 	const handlers = new Map<string, Handler[]>();
+	const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
 	const compact = mock.fn((opts: { onComplete?: () => void }) => opts.onComplete?.());
 	const pi = {
 		on: (name: string, h: Handler) => {
@@ -35,6 +40,8 @@ function setup(settings: Record<string, unknown>, state: { idle?: boolean; token
 			return () => {};
 		},
 		getSettings: () => settings,
+		registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) =>
+			commands.set(name, command),
 	};
 	const ctx = {
 		isIdle: () => state.idle ?? true,
@@ -43,10 +50,26 @@ function setup(settings: Record<string, unknown>, state: { idle?: boolean; token
 		sessionManager: { getBranch: () => [{ type: "message" }, { type: state.lastType ?? "message" }] },
 		model: { provider: "p", id: "m" },
 		compact,
+		mode: "tui",
+		ui: {
+			notify: mock.fn(),
+			// Mirrors pi: a custom UI is a UI prompt, so it emits ui_prompt_start/end around it.
+			custom: async (factory: (...args: unknown[]) => { handleInput(data: string): void }) => {
+				emit("ui_prompt_start");
+				const component = factory({ requestRender() {} }, undefined, undefined, () => {});
+				for (const key of panelKeys) component.handleInput(key);
+				emit("ui_prompt_end");
+			},
+		},
 	};
+	let panelKeys: string[] = [];
 	idleCompaction(pi as never);
 	const emit = (name: string, event: unknown = {}) => (handlers.get(name) ?? []).map((h) => h(event, ctx));
-	return { emit, compact };
+	const runCommand = async (keys: string[]) => {
+		panelKeys = keys;
+		await commands.get("idle-compact")!.handler("", ctx);
+	};
+	return { emit, compact, runCommand };
 }
 
 describe("idle timer", () => {
@@ -108,6 +131,29 @@ describe("idle timer", () => {
 		assert.deepEqual(emit("cache_warming_decision"), [{ action: "stop" }]);
 		emit("agent_start");
 		assert.deepEqual(emit("cache_warming_decision"), [undefined]);
+	});
+
+	it("applies and saves changes from /idle-compact", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "idle-compact-"));
+		process.env.PI_CODING_AGENT_DIR = dir;
+		after(() => {
+			delete process.env.PI_CODING_AGENT_DIR;
+			rmSync(dir, { recursive: true, force: true });
+		});
+		initTheme("dark");
+		const { emit, compact, runCommand } = setup(settings);
+		// Second item (timeout) cycles from the custom 1 sec value to 5 min.
+		await runCommand(["\x1b[B", "\r"]);
+		assert.deepEqual(JSON.parse(readFileSync(join(dir, "settings.json"), "utf-8")), {
+			idleCompaction: { timeoutMs: 300_000 },
+		});
+		// Applies immediately, although pi.getSettings() still returns the old value.
+		await new Promise((resolve) => queueMicrotask(() => resolve(undefined)));
+		emit("agent_settled");
+		mock.timers.tick(1000);
+		assert.equal(compact.mock.callCount(), 0);
+		mock.timers.tick(299_000);
+		assert.equal(compact.mock.callCount(), 1);
 	});
 
 	it("clears on shutdown", () => {
